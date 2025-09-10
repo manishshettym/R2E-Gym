@@ -40,6 +40,13 @@ command_files:
   - "./src/r2egym/agenthub/tools/finish.py"
 llm_name: "gpt-4o"
 demo_file: "./r2egym/agenthub/config/localizer-demo"
+fusion_k: 3
+fusion_prompt: |-
+  Here are {num_responses} options to review for the next action to take:
+  {responses_text}
+
+  It is possible that any, all, or none of these actions are correct. Carefully review the provided actions, using them as starting points--correcting mistakes, filling in gaps, and/or combining useful ideas--to produce a final and correct next action.
+fusion_temperature: 0.3
 other_args:
   max_retries: 3
   timeout: 120

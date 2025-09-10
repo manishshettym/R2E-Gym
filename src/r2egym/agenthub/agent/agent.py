@@ -8,6 +8,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import litellm
 from openai import OpenAI
@@ -28,8 +29,10 @@ from r2egym.agenthub.tools import (
     submit_tool,
 )
 import traceback
+
 logger = get_logger(__name__)  # Logger for this module
 MAX_CONTEXT_TOKENS = 65536
+
 
 ##############################################################################
 # AgentArgs Dataclass
@@ -44,6 +47,9 @@ class AgentArgs:
     demo_file: Optional[Path] = None
     use_demo: Optional[bool] = False
     other_args: Optional[Dict[str, Any]] = None  # To handle extra configurations
+    fusion_k: Optional[int] = None  # If set, enables generative fusion with k responses
+    fusion_prompt: Optional[str] = None  # Custom fusion prompt, uses default if None
+    fusion_temperature: Optional[float] = 0.3
 
     @classmethod
     def from_yaml(cls, yaml_path: Path) -> "AgentArgs":
@@ -81,8 +87,11 @@ class Agent:
         self.logger.info(f"Initialized Agent: {name} with LLM: {args.llm_name}")
         self.max_retries = self.other_args.get("max_retries", 5)
         self.llm_timeout = self.other_args.get("timeout", 3000)
-
-
+        self.fusion_k = args.fusion_k
+        self.fusion_prompt = args.fusion_prompt
+        self.fusion_temperature = args.fusion_temperature
+        if self.fusion_k:
+            self.logger.info(f"Generative fusion enabled with k={self.fusion_k}")
 
     def prepare_system_message(
         self, problem_statement: str, structure: str, command_docs: str, demo: str
@@ -151,15 +160,20 @@ class Agent:
         return token_count
 
     def model_query(
-        self, messages: List[Dict[str, str]], temperature: float = 0,) -> Dict[str, Any]:
-        """Query the LLM with the messages and measure execution time."""
+        self, messages: List[Dict[str, str]], temperature: float = 0
+    ) -> Tuple[Any, float]:
         response = None
         retries = 0
         tools = None
 
         if self.use_fn_calling:
             if self.scaffold == "r2egym":
-                tools = [search_tool, file_editor, r2egym_bash_execute_tool, finish_tool]
+                tools = [
+                    search_tool,
+                    file_editor,
+                    r2egym_bash_execute_tool,
+                    finish_tool,
+                ]
             elif self.scaffold == "openhands" or self.scaffold == "sweagent":
                 tools = [str_replace_editor_tool, execute_bash_tool, submit_tool]
             if "vertex" not in self.llm_name.lower():
@@ -189,7 +203,7 @@ class Agent:
         if total_tokens > MAX_CONTEXT_TOKENS:
             logger.warning(f"Total tokens: {total_tokens} > {MAX_CONTEXT_TOKENS}")
             raise ValueError(f"Total tokens: {total_tokens} > {MAX_CONTEXT_TOKENS}")
-        
+
         # query the model with retries
         while retries < self.max_retries:
             try:
@@ -199,7 +213,11 @@ class Agent:
                 }
                 if tools:
                     kwargs = {}
-                if "o3" not in self.llm_name and "o4" not in self.llm_name:
+                if (
+                    "o3" not in self.llm_name
+                    and "o4" not in self.llm_name
+                    and "gpt-5" not in self.llm_name
+                ):
                     kwargs["temperature"] = temperature
                 response = litellm.completion(
                     model=self.llm_name,
@@ -223,6 +241,70 @@ class Agent:
         # End timer, calculate total execution time, and include in response
         exec_time = time.time() - start_time
         return response, exec_time
+
+    def model_query_generative_fusion(
+        self, messages: List[Dict[str, str]], temperature: float = 0
+    ) -> Tuple[Any, float]:
+        """Generate k responses and fuse them into a final response."""
+        self.logger.info(f"Using generative fusion with k={self.fusion_k}")
+
+        # Generate k responses in parallel
+        with ThreadPoolExecutor(max_workers=self.fusion_k) as executor:
+            futures = {
+                executor.submit(self.model_query, messages, temperature): i
+                for i in range(self.fusion_k)
+            }
+            responses = []
+            failed_count = 0
+
+            for future in as_completed(futures):
+                i = futures[future]
+                try:
+                    response, exec_time = future.result()
+                    self.logger.info(f"Got generative fusion response {i}")
+                    responses.append((response, exec_time))
+                except Exception as e:
+                    failed_count += 1
+                    self.logger.warning(f"Failed to get response {i}: {e}")
+
+            if failed_count > 0:
+                self.logger.warning(
+                    f"Failed to generate {failed_count}/{self.fusion_k} responses"
+                )
+
+        if not responses:
+            self.logger.error("No responses generated, falling back to single query")
+            return self.model_query(messages, temperature)
+
+        if len(responses) == 1:
+            self.logger.info("Only one response available, returning it directly")
+            return responses[0]
+
+        # Fuse the responses
+        self.logger.info(f"Fusing {len(responses)} responses")
+        fusion_messages = copy.deepcopy(messages)
+        responses_text = ""
+        for i, (response, _) in enumerate(responses):
+            if self.use_fn_calling:
+                _, action = self.custom_parser(response)
+            else:
+                assistant_message = response.choices[0].message.content
+                _, action = self.parse_response(assistant_message)
+            responses_text += f"\n\n--- Action {i+1} ---\n{action.to_bashcmd()}"
+
+        fusion_prompt = self.fusion_prompt.format(
+            num_responses=len(responses), responses_text=responses_text
+        )
+        self.logger.info(f"Fusion prompt: {fusion_prompt}")
+        fusion_messages.append({"role": "user", "content": fusion_prompt})
+        fused_response, fusion_exec_time = self.model_query(
+            fusion_messages, self.fusion_temperature
+        )
+        self.logger.info(f"Fused response: {fused_response.choices[0].message.content}")
+
+        max_exec_time = max(exec_time for _, exec_time in responses)
+        total_exec_time = max_exec_time + fusion_exec_time
+        return fused_response, total_exec_time
 
     def parse_response(self, response: Dict[str, Any]) -> Tuple[str, Action]:
         """
@@ -320,7 +402,11 @@ class Agent:
         metadata: Optional[Dict[str, Any]] = {},
         scaffold: str = "r2egym",
     ):
-        assert scaffold in ["r2egym", "openhands", "sweagent"], "Scaffold must be either r2egym or openhands or sweagent"
+        assert scaffold in [
+            "r2egym",
+            "openhands",
+            "sweagent",
+        ], "Scaffold must be either r2egym or openhands or sweagent"
         self.scaffold = scaffold
         # get the start time
         start_time = time.time()
@@ -355,7 +441,7 @@ class Agent:
         user_prompt = self.instance_prompt_template.format(
             problem_statement=problem_statement,
             gt_patch=gt_patch,
-            working_dir='/testbed',
+            working_dir="/testbed",
             # base_commit=env.runtime.ds['base_commit'],
             test_patch_hint=metadata.get("test_patch_hint", ""),
             candidate_patch=metadata.get("candidate_patch", ""),
@@ -404,7 +490,12 @@ class Agent:
             # Query the LLM
             messages = copy.deepcopy(self.history)
             try:
-                response, llm_exec_time = self.model_query(messages, temperature)
+                if self.fusion_k and self.fusion_k > 1:
+                    response, llm_exec_time = self.model_query_generative_fusion(
+                        messages, temperature
+                    )
+                else:
+                    response, llm_exec_time = self.model_query(messages, temperature)
             except Exception as e:
                 self.logger.error(f"Error querying LLM: {e}")
                 self.logger.error(f"Error querying LLM: {traceback.format_exc()}")
@@ -428,7 +519,7 @@ class Agent:
                 completion_tokens = -1
                 prompt_tokens = -1
                 total_tokens = -1
-                total_tokens =  self._count_tokens(messages)
+                total_tokens = self._count_tokens(messages)
                 self.logger.warning(
                     "No token usage information available in the response."
                 )
